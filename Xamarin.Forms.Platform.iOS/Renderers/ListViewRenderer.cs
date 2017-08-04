@@ -25,7 +25,6 @@ namespace Xamarin.Forms.Platform.iOS
 		KeyboardInsetTracker _insetTracker;
 		RectangleF _previousFrame;
 		ScrollToRequestedEventArgs _requestedScroll;
-		bool _shouldEstimateRowHeight = true;
 
 		FormsUITableViewController _tableViewController;
 		ListView ListView => Element;
@@ -212,7 +211,6 @@ namespace Xamarin.Forms.Platform.iOS
 						Control.SetContentOffset(offset, true);
 					});
 				}
-				_shouldEstimateRowHeight = true;
 
 				var listView = e.NewElement;
 
@@ -366,35 +364,36 @@ namespace Xamarin.Forms.Platform.iOS
 
 		void UpdateEstimatedRowHeight()
 		{
-			var rowHeight = Element.RowHeight;
-			if (Element.HasUnevenRows && rowHeight == -1)
-			{
-				var source = _dataSource as UnevenListViewDataSource;
+			if (_estimatedRowHeight)
+				return;
 
-				// We want to make sure we reset the cached defined row heights whenever this is called.
-				// Failing to do this will regress Bugzilla 43313 (strange animation when adding rows with uneven heights)
-				source?.CacheDefinedRowHeights();
-
-				if (_shouldEstimateRowHeight && !_estimatedRowHeight)
-				{
-					if (source != null)
-					{
-						Control.EstimatedRowHeight = source.GetEstimatedRowHeight(Control);
-						_estimatedRowHeight = true;
-					}
-					else
-					{
-						//We need to set a default estimated row height, because re-setting it later(when we have items on the TIL)
-						//will cause the UITableView to reload, and throw an Exception
-						Control.EstimatedRowHeight = DefaultRowHeight;
-					}
-				}
-			}
-			else if (!_estimatedRowHeight)
+			// if even rows OR uneven rows but user specified a row height anyway...
+			if (!Element.HasUnevenRows || Element.RowHeight != -1)
 			{
 				Control.EstimatedRowHeight = 0;
 				_estimatedRowHeight = true;
+				return;
 			}
+
+			var source = _dataSource as UnevenListViewDataSource;
+
+			// We want to make sure we reset the cached defined row heights whenever this is called.
+			// Failing to do this will regress Bugzilla 43313 
+			// (strange animation when adding rows with uneven heights)
+			//source?.CacheDefinedRowHeights();
+
+			if (source == null)
+			{
+				// We need to set a default estimated row height, 
+				// because re-setting it later(when we have items on the TIL)
+				// will cause the UITableView to reload, and throw an Exception
+				Control.EstimatedRowHeight = DefaultRowHeight;
+				return;
+			}
+
+			Control.EstimatedRowHeight = source.GetEstimatedRowHeight(Control);
+			_estimatedRowHeight = true;
+			return;
 		}
 
 		void UpdateFooter()
@@ -498,6 +497,8 @@ namespace Xamarin.Forms.Platform.iOS
 
 		void UpdateItems(NotifyCollectionChangedEventArgs e, int section, bool resetWhenGrouped)
 		{
+			_dataSource.InvalidatePrototypicalCellCache();
+
 			var exArgs = e as NotifyCollectionChangedEventArgsEx;
 			if (exArgs != null)
 				_dataSource.Counts[section] = exArgs.Count;
@@ -627,7 +628,9 @@ namespace Xamarin.Forms.Platform.iOS
 		{
 			IVisualElementRenderer _prototype;
 			bool _disposed;
-			bool _useEstimatedRowHeight;
+			Dictionary<Type, Cell> _cellByType = new Dictionary<Type, Cell>();
+			Dictionary<NSIndexPath, Cell> _cellByIndex = new Dictionary<NSIndexPath, Cell>();
+			//bool _useEstimatedRowHeight;
 
 			ConcurrentDictionary<NSIndexPath, nfloat> _rowHeights = new ConcurrentDictionary<NSIndexPath, nfloat>();
 
@@ -639,23 +642,23 @@ namespace Xamarin.Forms.Platform.iOS
 			{
 			}
 
-			internal void CacheDefinedRowHeights()
-			{
-				Task.Run(() =>
-				{
-					var templatedItems = TemplatedItemsView.TemplatedItems;
+			//internal void CacheDefinedRowHeights()
+			//{
+			//	Task.Run(() =>
+			//	{
+			//		var templatedItems = TemplatedItemsView.TemplatedItems;
 
-					foreach (var cell in templatedItems)
-					{
-						if (_disposed)
-							return;
+			//		foreach (var cell in templatedItems)
+			//		{
+			//			if (_disposed)
+			//				return;
 
-						double? cellRenderHeight = cell?.RenderHeight;
-						if (cellRenderHeight > 0)
-							_rowHeights[cell.GetIndexPath()] = (nfloat)cellRenderHeight;
-					}
-				});
-			}
+			//			double? cellRenderHeight = cell?.RenderHeight;
+			//			if (cellRenderHeight > 0)
+			//				_rowHeights[cell.GetIndexPath()] = (nfloat)cellRenderHeight;
+			//		}
+			//	});
+			//}
 
 			internal nfloat GetEstimatedRowHeight(UITableView table)
 			{
@@ -692,22 +695,56 @@ namespace Xamarin.Forms.Platform.iOS
 				return CalculateHeightForCell(table, firstCell);
 			}
 
-			public override nfloat EstimatedHeight(UITableView tableView, NSIndexPath indexPath)
+			//public override nfloat EstimatedHeight(UITableView tableView, NSIndexPath indexPath)
+			//	=> 300;
+			//public override nfloat EstimatedHeight(UITableView tableView, NSIndexPath indexPath)
+			//{
+			//	if (_useEstimatedRowHeight)
+			//		return tableView.EstimatedRowHeight;
+
+			//	// Note: It is *not* an optimization to first check if the array has any values.
+			//	nfloat specifiedRowHeight;
+			//	if (_rowHeights.TryGetValue(indexPath, out specifiedRowHeight) && specifiedRowHeight > 0)
+			//		return specifiedRowHeight;
+
+			//	return UITableView.AutomaticDimension;
+			//}
+
+			internal override void InvalidatePrototypicalCellCache()
 			{
-				if (_useEstimatedRowHeight)
-					return tableView.EstimatedRowHeight;
+				_cellByIndex.Clear();
+				_cellByType.Clear();
+			}
 
-				// Note: It is *not* an optimization to first check if the array has any values.
-				nfloat specifiedRowHeight;
-				if (_rowHeights.TryGetValue(indexPath, out specifiedRowHeight) && specifiedRowHeight > 0)
-					return specifiedRowHeight;
+			internal Cell GetPrototypicalCell(NSIndexPath indexPath)
+			{
+				var cachingStrategy = List.CachingStrategy;
+				if ((cachingStrategy & ListViewCachingStrategy.RecycleElementAndDataTemplate) !=
+					ListViewCachingStrategy.RecycleElementAndDataTemplate)
+					return GetCellForPath(indexPath);
 
-				return UITableView.AutomaticDimension;
+				Cell protoCell;
+				if (!_cellByIndex.TryGetValue(indexPath, out protoCell))
+				{
+					var itemType = GetItemTypeForPath(indexPath);
+					if (!_cellByType.TryGetValue(itemType, out protoCell))
+					{
+						// cache prototypical cell by item type; Items of the same Type share
+						// the same DataTemplate (this is enforced by RecycleElementAndDataTemplate)
+						protoCell = GetCellForPath(indexPath);
+						_cellByType[itemType] = protoCell;
+					}
+
+					_cellByIndex[indexPath] = protoCell;
+				}
+
+				var templatedItems = GetTemplatedItemsListForPath(indexPath);
+				return templatedItems.UpdateContent(protoCell, indexPath.Row);
 			}
 
 			public override nfloat GetHeightForRow(UITableView tableView, NSIndexPath indexPath)
 			{
-				var cell = GetCellForPath(indexPath);
+				var cell = GetPrototypicalCell(indexPath);
 
 				if (List.RowHeight == -1 && cell.Height == -1 && cell is ViewCell)
 					return UITableView.AutomaticDimension;
@@ -751,7 +788,7 @@ namespace Xamarin.Forms.Platform.iOS
 
 					// Let the EstimatedHeight method know to use this value.
 					// Much more efficient than checking the value each time.
-					_useEstimatedRowHeight = true;
+					//_useEstimatedRowHeight = true;
 					return (nfloat)req.Request.Height;
 				}
 
@@ -824,6 +861,10 @@ namespace Xamarin.Forms.Platform.iOS
 				get { return UIColor.Clear; }
 			}
 
+			internal virtual void InvalidatePrototypicalCellCache()
+			{
+			}
+
 			public override void DraggingEnded(UIScrollView scrollView, bool willDecelerate)
 			{
 				_isDragging = false;
@@ -846,13 +887,14 @@ namespace Xamarin.Forms.Platform.iOS
 					cell = GetCellForPath(indexPath);
 					nativeCell = CellTableViewCell.GetNativeCell(tableView, cell);
 				}
-				else if (cachingStrategy == ListViewCachingStrategy.RecycleElement)
+				else if ((cachingStrategy & ListViewCachingStrategy.RecycleElement) != 0)
 				{
 					var id = TemplateIdForPath(indexPath);
 					nativeCell = tableView.DequeueReusableCell(ContextActionsCell.Key + id);
 					if (nativeCell == null)
 					{
 						cell = GetCellForPath(indexPath);
+
 						nativeCell = CellTableViewCell.GetNativeCell(tableView, cell, true, id.ToString());
 					}
 					else
@@ -972,7 +1014,7 @@ namespace Xamarin.Forms.Platform.iOS
 					return;
 
 				Cell formsCell = null;
-				if (List.CachingStrategy == ListViewCachingStrategy.RecycleElement)
+				if ((List.CachingStrategy & ListViewCachingStrategy.RecycleElement) != 0)
 					formsCell = (Cell)((INativeElementView)cell).Element;
 
 				SetCellBackgroundColor(cell, UIColor.Clear);
@@ -1036,12 +1078,25 @@ namespace Xamarin.Forms.Platform.iOS
 				_uiTableView.ReloadData();
 			}
 
-			protected Cell GetCellForPath(NSIndexPath indexPath)
+			protected ITemplatedItemsList<Cell> GetTemplatedItemsListForPath(NSIndexPath indexPath)
 			{
 				var templatedItems = TemplatedItemsView.TemplatedItems;
 				if (List.IsGroupingEnabled)
-					templatedItems = (TemplatedItemsList<ItemsView<Cell>, Cell>)((IList)templatedItems)[indexPath.Section];
+					templatedItems = (ITemplatedItemsList<Cell>)((IList)templatedItems)[indexPath.Section];
 
+				return templatedItems;
+			}
+
+			protected Type GetItemTypeForPath(NSIndexPath indexPath)
+			{
+				var templatedList = GetTemplatedItemsListForPath(indexPath);
+				var item = templatedList.ListProxy[indexPath.Row];
+				return item.GetType();
+			}
+
+			protected Cell GetCellForPath(NSIndexPath indexPath)
+			{
+				var templatedItems = GetTemplatedItemsListForPath(indexPath);
 				var cell = templatedItems[indexPath.Row];
 				return cell;
 			}
@@ -1087,10 +1142,7 @@ namespace Xamarin.Forms.Platform.iOS
 				if (selector == null)
 					return DefaultItemTemplateId;
 
-				var templatedList = TemplatedItemsView.TemplatedItems;
-				if (List.IsGroupingEnabled)
-					templatedList = (TemplatedItemsList<ItemsView<Cell>, Cell>)((IList)templatedList)[indexPath.Section];
-
+				var templatedList = GetTemplatedItemsListForPath(indexPath);
 				var item = templatedList.ListProxy[indexPath.Row];
 
 				itemTemplate = selector.SelectTemplate(item, List);
